@@ -1,140 +1,181 @@
 #![no_std]
-
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
 
 #[contracttype]
 #[derive(Clone)]
 pub struct Campaign {
     pub creator: Address,
+    pub title: String,
+    pub description: String,
     pub goal: i128,
-    pub pledged: i128,
     pub deadline: u64,
-    pub claimed: bool,
+    pub raised: i128,
+    pub withdrawn: bool,
 }
 
 #[contracttype]
 pub enum DataKey {
-    Campaign(u32),
+    Campaign(u64),
+    Donation(u64, Address),
+    CampaignIds,
     CampaignCount,
-    Pledge(u32, Address),
 }
 
 #[contract]
-pub struct CrowdfundingContract;
+pub struct Contract;
 
 #[contractimpl]
-impl CrowdfundingContract {
-
-    // Create a new campaign
+impl Contract {
     pub fn create_campaign(
         env: Env,
         creator: Address,
+        title: String,
+        description: String,
         goal: i128,
-        duration: u64,
-    ) -> u32 {
+        deadline: u64,
+    ) -> u64 {
         creator.require_auth();
+        assert!(goal > 0, "goal must be positive");
+        assert!(
+            deadline > env.ledger().timestamp(),
+            "deadline must be in future"
+        );
 
-        let count: u32 = env.storage().instance()
+        let count: u64 = env
+            .storage()
+            .persistent()
             .get(&DataKey::CampaignCount)
             .unwrap_or(0);
+        let id = count + 1;
+
+        env.storage().persistent().set(&DataKey::CampaignCount, &id);
 
         let campaign = Campaign {
-            creator: creator.clone(),
+            creator,
+            title,
+            description,
             goal,
-            pledged: 0,
-            deadline: env.ledger().timestamp() + duration,
-            claimed: false,
+            deadline,
+            raised: 0,
+            withdrawn: false,
         };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(id), &campaign);
 
-        env.storage().instance().set(&DataKey::Campaign(count), &campaign);
-        env.storage().instance().set(&DataKey::CampaignCount, &(count + 1));
+        let mut ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CampaignIds)
+            .unwrap_or(Vec::new(&env));
+        ids.push_back(id);
+        env.storage().persistent().set(&DataKey::CampaignIds, &ids);
 
-        count
+        id
     }
 
-    // Pledge funds
-    pub fn pledge(env: Env, id: u32, from: Address, amount: i128) {
-        from.require_auth();
+    pub fn donate(env: Env, donor: Address, campaign_id: u64, amount: i128) {
+        donor.require_auth();
+        assert!(amount > 0, "donation must be positive");
 
-        let mut campaign: Campaign = env.storage().instance()
-            .get(&DataKey::Campaign(id))
-            .expect("Campaign not found");
+        let mut campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .expect("campaign not found");
 
-        if env.ledger().timestamp() > campaign.deadline {
-            panic!("Campaign ended");
-        }
+        assert!(
+            env.ledger().timestamp() <= campaign.deadline,
+            "campaign ended"
+        );
 
-        campaign.pledged += amount;
-
-        let prev: i128 = env.storage().instance()
-            .get(&DataKey::Pledge(id, from.clone()))
+        let mut donation: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Donation(campaign_id, donor.clone()))
             .unwrap_or(0);
 
-        env.storage().instance()
-            .set(&DataKey::Pledge(id, from), &(prev + amount));
+        donation += amount;
+        campaign.raised += amount;
 
-        env.storage().instance().set(&DataKey::Campaign(id), &campaign);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Donation(campaign_id, donor), &donation);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
     }
 
-    // Claim funds if goal reached
-    pub fn claim(env: Env, id: u32, creator: Address) {
+    pub fn withdraw(env: Env, creator: Address, campaign_id: u64) {
         creator.require_auth();
 
-        let mut campaign: Campaign = env.storage().instance()
-            .get(&DataKey::Campaign(id))
-            .expect("Campaign not found");
+        let mut campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .expect("campaign not found");
 
-        if creator != campaign.creator {
-            panic!("Not creator");
-        }
+        assert_eq!(campaign.creator, creator, "not creator");
+        assert!(
+            env.ledger().timestamp() > campaign.deadline,
+            "deadline not passed"
+        );
+        assert!(campaign.raised >= campaign.goal, "goal not reached");
+        assert!(!campaign.withdrawn, "already withdrawn");
 
-        if campaign.pledged < campaign.goal {
-            panic!("Goal not reached");
-        }
-
-        if campaign.claimed {
-            panic!("Already claimed");
-        }
-
-        campaign.claimed = true;
-
-        env.storage().instance().set(&DataKey::Campaign(id), &campaign);
+        campaign.withdrawn = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
     }
 
-    // Refund if goal not reached
-    pub fn refund(env: Env, id: u32, user: Address) {
-        user.require_auth();
+    pub fn claim_refund(env: Env, donor: Address, campaign_id: u64) {
+        donor.require_auth();
 
-        let campaign: Campaign = env.storage().instance()
-            .get(&DataKey::Campaign(id))
-            .expect("Campaign not found");
+        let campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .expect("campaign not found");
 
-        if env.ledger().timestamp() <= campaign.deadline {
-            panic!("Campaign still active");
-        }
+        assert!(
+            env.ledger().timestamp() > campaign.deadline,
+            "deadline not passed"
+        );
+        assert!(campaign.raised < campaign.goal, "goal was reached");
 
-        if campaign.pledged >= campaign.goal {
-            panic!("Goal was reached");
-        }
-
-        let pledged: i128 = env.storage().instance()
-            .get(&DataKey::Pledge(id, user.clone()))
+        let donation: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Donation(campaign_id, donor.clone()))
             .unwrap_or(0);
+        assert!(donation > 0, "no donation to refund");
 
-        if pledged <= 0 {
-            panic!("No funds to refund");
-        }
-
-        env.storage().instance()
-            .set(&DataKey::Pledge(id, user), &0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Donation(campaign_id, donor), &0i128);
     }
 
-    // View campaign
-    pub fn get_campaign(env: Env, id: u32) -> Campaign {
-        env.storage().instance()
-            .get(&DataKey::Campaign(id))
-            .expect("Campaign not found")
+    pub fn get_campaign(env: Env, campaign_id: u64) -> Campaign {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .expect("campaign not found")
+    }
+
+    pub fn get_donation(env: Env, campaign_id: u64, donor: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Donation(campaign_id, donor))
+            .unwrap_or(0)
+    }
+
+    pub fn get_all_campaign_ids(env: Env) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CampaignIds)
+            .unwrap_or(Vec::new(&env))
     }
 }
+
+mod test;
